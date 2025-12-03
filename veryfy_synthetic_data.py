@@ -1,285 +1,637 @@
-import pandas as pd
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+合成データ品質評価スクリプト
 
+目的:
+    ・元データ（実データ）と合成データの統計的・構造的な再現性を評価する
+    ・合成データの妥当性（不自然な値・制約違反）の有無を確認する
+    ・評価結果を「数値」と「可視化」の両方で確認できるようにする
 
-# 3. 前処理・整合性チェック
-# 3.1 スキーマ & 型の一致
-# 実データ・合成データで
-# カラム名集合
-# 各カラムの dtype（int/float/object…）
-# が一致しているかを確認。
+ポイント:
+    ・数値が出たときに「それが良いのか悪いのか」がわかるよう、
+      閾値ベースの簡易評価（◎/○/△/×）を付与する
+    ・絶対的な指標がないものは、可視化を画像ファイルとして出力し、
+      見比べて判断できるようにする
+    ・GitHubでそのまま共有できるよう、1ファイルのPythonスクリプト形式で記述
+"""
 
-# 仮：ファイル名は適宜変更してください
-master_real = pd.read_csv("master_real.csv")
-master_syn  = pd.read_csv("master_syn.csv")
-yearly_real = pd.read_csv("yearly_real.csv")
-yearly_syn  = pd.read_csv("yearly_syn.csv")
-
-def compare_schema(df_real, df_syn, name):
-    print(f"=== {name} schema ===")
-    print("real dtypes:")
-    print(df_real.dtypes)
-    print("\nsynthetic dtypes:")
-    print(df_syn.dtypes)
-    print("\nMissing in synthetic:", set(df_real.columns) - set(df_syn.columns))
-    print("Extra in synthetic:", set(df_syn.columns) - set(df_real.columns))
-
-compare_schema(master_real, master_syn, "master")
-compare_schema(yearly_real, yearly_syn, "yearly")
-
-# 3.2 キー制約・親子関係のチェック
-# 親：コード が ユニーク か
-# 子：(コード, YEAR) が 一意 か
-# 子の コード が必ず親に存在するか（referential integrity）
-def check_keys(master, yearly, name):
-    print(f"=== key check ({name}) ===")
-    # 親キー
-    dup_master = master['コード'].duplicated().sum()
-    print("master duplicate コード:", dup_master)
-
-    # 子キー
-    dup_yearly = yearly[['コード', 'YEAR']].duplicated().sum()
-    print("yearly duplicate (コード, YEAR):", dup_yearly)
-
-    # 参照整合性
-    missing_parents = (~yearly['コード'].isin(master['コード'])).sum()
-    print("yearly rows with コード not in master:", missing_parents)
-
-check_keys(master_real, yearly_real, "real")
-check_keys(master_syn, yearly_syn, "synthetic")
-
-4. 統計的再現性（全特徴量）
-# ポイント：
-# 「主要項目だけ」ではなく、全数値カラムをループで評価する
-# 実データをゴールドスタンダードとして、差分を指標化する
-# 4.1 数値カラムの単変量分布比較
-# 平均・標準偏差・分位点（5%, 25%, 50%, 75%, 95%）
-# 分布距離（例：Kolmogorov-Smirnov, Wasserstein distance）
+import os
 import numpy as np
+import pandas as pd
 from scipy.stats import ks_2samp
+from scipy.spatial.distance import jensenshannon
+import matplotlib.pyplot as plt
+from typing import Dict, Tuple, List, Optional
 
-def numeric_distribution_summary(df, numeric_cols):
-    q = [0.05, 0.25, 0.5, 0.75, 0.95]
-    desc = df[numeric_cols].describe(percentiles=q).T
-    return desc
 
-def compare_numeric_distributions(df_real, df_syn, name):
+# =====================================================
+# 設定（必要に応じて書き換えてください）
+# =====================================================
+
+# 入力ファイルパス
+MASTER_REAL_PATH = "master_real.csv"
+MASTER_SYN_PATH  = "master_syn.csv"
+YEARLY_REAL_PATH = "yearly_real.csv"
+YEARLY_SYN_PATH  = "yearly_syn.csv"
+
+# 出力先ディレクトリ（図の保存先）
+FIG_DIR = "figs"
+
+# 評価に使うカラム名（スキーマに合わせて調整）
+YEAR_COL         = "YEAR"
+CODE_COL         = "コード"
+INDUSTRY_COL     = "業種分類"
+MARKET_COL       = "市場・商品区分"
+VALUE_COL_MAIN   = "売上高"   # 時系列評価・業種別評価のメイン指標
+
+TOTAL_ASSET_COL  = "総資産"
+DEBT_COL         = "負債"
+EQUITY_COL       = "純資産"
+
+# レンジチェックのルール（下限, 上限）
+RANGE_RULES_YEARLY: Dict[str, Tuple[Optional[float], Optional[float]]] = {
+    "売上高": (0, None),
+    "営業利益": (None, None),  # 赤字許容なら下限なし
+    "総資産": (0, None),
+    "負債": (0, None),
+    # "純資産": (None, None),  # マイナス純資産を許容するなら下限なし
+}
+
+# 外れ値率を確認するカラム
+OUTLIER_COLS = ["売上高", "営業利益", "総資産"]
+
+
+# =====================================================
+# ユーティリティ（評価ラベルなど）
+# =====================================================
+
+def score_ks(stat: float) -> str:
+    """
+    KS統計量に対する簡易評価ラベルを返す。
+    一般的な「経験的な目安」に基づく主観的な評価。
+    """
+    if stat < 0.05:
+        return "◎ 非常によく一致（ほぼ同じ分布とみなせる）"
+    elif stat < 0.10:
+        return "○ 概ね一致（用途によっては十分）"
+    elif stat < 0.20:
+        return "△ やや差がある（重要指標なら要検討）"
+    else:
+        return "× 大きく異なる（再学習や修正候補）"
+
+
+def score_js(dist: float) -> str:
+    """
+    Jensen-Shannon 距離に対する簡易評価ラベル。
+    0に近いほどカテゴリ分布が似ている。
+    """
+    if dist < 0.05:
+        return "◎ 非常に近いカテゴリ分布"
+    elif dist < 0.15:
+        return "○ おおむね近いカテゴリ分布"
+    elif dist < 0.30:
+        return "△ かなり差があるカテゴリも存在"
+    else:
+        return "× カテゴリ構成が大きく異なる"
+
+
+def score_corr_mean_abs_diff(diff: float) -> str:
+    """
+    相関行列の平均絶対差分に対する簡易評価ラベル。
+    0に近いほどカラム同士の関係性が似ている。
+    """
+    if diff < 0.05:
+        return "◎ 相関構造は非常によく再現されている"
+    elif diff < 0.10:
+        return "○ おおむね再現できている"
+    elif diff < 0.20:
+        return "△ 相関構造にややズレがある"
+    else:
+        return "× 相関構造がかなり異なる"
+
+
+def score_ratio_small_is_good(ratio: float) -> str:
+    """
+    違反率など「小さいほど良い」指標に対する評価ラベル。
+    """
+    if ratio < 0.01:
+        return "◎ ほぼ問題なし"
+    elif ratio < 0.05:
+        return "○ 一部に問題はあるが、全体としては許容範囲"
+    elif ratio < 0.15:
+        return "△ それなりの頻度で問題がある（要注意）"
+    else:
+        return "× 多数の問題が存在（要修正）"
+
+
+def ensure_fig_dir():
+    if not os.path.exists(FIG_DIR):
+        os.makedirs(FIG_DIR, exist_ok=True)
+
+
+# =====================================================
+# データ読み込み
+# =====================================================
+
+def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    CSVからデータを読み込む。
+    実プロジェクトでは、ファイルパスやエンコーディング等を環境に合わせて調整してください。
+    """
+    print("=== データ読み込み ===")
+    master_real = pd.read_csv(MASTER_REAL_PATH)
+    master_syn  = pd.read_csv(MASTER_SYN_PATH)
+    yearly_real = pd.read_csv(YEARLY_REAL_PATH)
+    yearly_syn  = pd.read_csv(YEARLY_SYN_PATH)
+
+    print(f"master_real: {master_real.shape}, master_syn: {master_syn.shape}")
+    print(f"yearly_real: {yearly_real.shape}, yearly_syn: {yearly_syn.shape}")
+    return master_real, master_syn, yearly_real, yearly_syn
+
+
+# =====================================================
+# 1. 数値カラムの分布比較（平均・分散・分位点 + KS検定 + 可視化）
+# =====================================================
+
+def plot_hist_overlay(df_real: pd.DataFrame,
+                      df_syn: pd.DataFrame,
+                      col: str,
+                      bins: int = 40) -> None:
+    """
+    実データと合成データのヒストグラムを重ねて出力する。
+    絶対的な指標がない場合でも、視覚的に分布の違いを確認できる。
+    """
+    ensure_fig_dir()
+    plt.figure(figsize=(6, 4))
+    real_values = df_real[col].dropna().values
+    syn_values  = df_syn[col].dropna().values
+
+    if len(real_values) == 0 or len(syn_values) == 0:
+        plt.close()
+        return
+
+    plt.hist(real_values, bins=bins, alpha=0.5, density=True, label="real")
+    plt.hist(syn_values,  bins=bins, alpha=0.5, density=True, label="synthetic")
+    plt.title(f"Histogram: {col}")
+    plt.xlabel(col)
+    plt.ylabel("density")
+    plt.legend()
+    plt.tight_layout()
+    path = os.path.join(FIG_DIR, f"hist_{col}.png")
+    plt.savefig(path)
+    plt.close()
+    print(f"    - ヒストグラム図を保存: {path}")
+
+
+def compare_numeric_distributions(df_real: pd.DataFrame,
+                                  df_syn: pd.DataFrame,
+                                  name: str,
+                                  top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    数値カラムごとに実データと合成データの分布差を評価する。
+
+    評価観点:
+        ・各数値カラムの分布（平均・分散・形状）がどの程度再現されているか
+        ・KS統計量が小さいカラムほど「分布が近い」
+        ・評価結果として「◎/○/△/×」の簡易ラベルを付与し、上位の悪いカラムは可視化
+    """
+    print(f"\n===== [{name}] 数値分布の再現性チェック =====")
+    print("評価観点: 各数値カラムの分布（平均・分散・形状）が実データとどれくらい近いかを確認する。")
+    print("         KS統計量を用いて定量評価し、さらに分布を重ね描きすることで視覚的にも確認する。\n")
+
     numeric_cols = df_real.select_dtypes(include=[np.number]).columns
-    print(f"=== numeric distribution ({name}) ===")
-    summary_real = numeric_distribution_summary(df_real, numeric_cols)
-    summary_syn  = numeric_distribution_summary(df_syn, numeric_cols)
+    if len(numeric_cols) == 0:
+        print("※ 数値カラムが存在しません。スキップします。")
+        return pd.DataFrame(), pd.DataFrame()
 
-    # サマリ
-    # print(summary_real.join(summary_syn, lsuffix="_real", rsuffix="_syn"))
+    # 要約統計量（参考用）
+    percentiles = [0.05, 0.25, 0.5, 0.75, 0.95]
+    desc_real = df_real[numeric_cols].describe(percentiles=percentiles).T
+    desc_syn  = df_syn[numeric_cols].describe(percentiles=percentiles).T
+    summary = desc_real.join(desc_syn, lsuffix="_real", rsuffix="_syn")
 
-    # KS距離など
-    rows = []
+    # KS検定
+    rows: List[Tuple[str, float, float, str]] = []
     for col in numeric_cols:
         r = df_real[col].dropna()
         s = df_syn[col].dropna()
-        if len(r) > 0 and len(s) > 0:
-            ks_stat, pval = ks_2samp(r, s)
-            rows.append((col, ks_stat, pval))
-    ks_df = pd.DataFrame(rows, columns=["col", "ks_stat", "pval"]).sort_values("ks_stat", ascending=False)
-    return ks_df
+        if len(r) == 0 or len(s) == 0:
+            continue
+        ks_stat, pval = ks_2samp(r, s)
+        label = score_ks(ks_stat)
+        rows.append((col, ks_stat, pval, label))
+    if not rows:
+        print("※ KS検定を実行できる十分なデータがありません。")
+        return summary, pd.DataFrame()
 
-ks_master = compare_numeric_distributions(master_real, master_syn, "master")
-ks_yearly = compare_numeric_distributions(yearly_real, yearly_syn, "yearly")
-print(ks_master.head())
-print(ks_yearly.head())
+    ks_df = pd.DataFrame(rows, columns=["col", "ks_stat", "pval", "eval"])
+    ks_df = ks_df.sort_values("ks_stat", ascending=False)
 
-# 4.2 カテゴリカラムの分布比較
-# 業種分類, 市場・商品区分 など
-# カテゴリ別のシェア（%）を比較
-# チャイ二乗距離や Jensen-Shannon 距離等
-from scipy.spatial.distance import jensenshannon
+    # 全体としての品質感
+    cond_good = ks_df["ks_stat"] < 0.10
+    ratio_good = cond_good.mean()
+    print("▼ KS統計量による全体評価（数値カラム単位）")
+    print(f"    KS < 0.10 のカラム割合: {ratio_good:.1%} → {score_ratio_small_is_good(1 - ratio_good)}")
 
-def compare_categorical_distribution(df_real, df_syn, col):
+    # 上位 n カラムを表示
+    print("\n▼ KS統計量が大きい（≒分布差が大きい）上位カラム")
+    print(ks_df.head(top_n).to_string(index=False))
+
+    # 上位の悪いカラムについてヒストグラムを出力
+    print("\n▼ 分布差が大きいカラムのヒストグラムを出力（目視確認用）")
+    for col in ks_df.head(top_n)["col"]:
+        print(f"  カラム: {col}")
+        plot_hist_overlay(df_real, df_syn, col)
+
+    return summary, ks_df
+
+
+# =====================================================
+# 2. カテゴリ分布の比較（業種・市場区分など + 可視化）
+# =====================================================
+
+def plot_category_bar(freq_real: pd.Series,
+                      freq_syn: pd.Series,
+                      col: str) -> None:
+    """
+    カテゴリごとの構成比を棒グラフで可視化する。
+    """
+    ensure_fig_dir()
+    categories = sorted(set(freq_real.index) | set(freq_syn.index))
+    x = np.arange(len(categories))
+    width = 0.4
+
+    real_vals = freq_real.reindex(categories, fill_value=0.0).values
+    syn_vals  = freq_syn.reindex(categories, fill_value=0.0).values
+
+    plt.figure(figsize=(max(6, len(categories) * 0.4), 4))
+    plt.bar(x - width/2, real_vals, width, label="real")
+    plt.bar(x + width/2, syn_vals,  width, label="synthetic")
+    plt.xticks(x, categories, rotation=90)
+    plt.ylabel("ratio")
+    plt.title(f"Category distribution: {col}")
+    plt.legend()
+    plt.tight_layout()
+    path = os.path.join(FIG_DIR, f"catdist_{col}.png")
+    plt.savefig(path)
+    plt.close()
+    print(f"    - カテゴリ分布図を保存: {path}")
+
+
+def compare_categorical_distribution(df_real: pd.DataFrame,
+                                     df_syn: pd.DataFrame,
+                                     col: str,
+                                     name: str) -> Tuple[pd.DataFrame, float]:
+    """
+    カテゴリカラムの分布を比較する。
+
+    評価観点:
+        ・業種や市場区分などのカテゴリ構成比が実データと似ているか
+        ・JS距離が小さいほどカテゴリ構成が似ている（定量評価）
+        ・棒グラフによる分布比較（視覚評価）
+    """
+    print(f"\n===== [{name}] カテゴリ分布の再現性チェック: {col} =====")
+    print("評価観点: カテゴリ（業種・区分など）の構成比が、実データと合成データで近いかを確認する。")
+    print("         Jensen-Shannon距離を用いて定量評価し、棒グラフで視覚的にも確認する。\n")
+
     freq_real = df_real[col].value_counts(normalize=True)
     freq_syn  = df_syn[col].value_counts(normalize=True)
 
-    # index を揃える
     all_idx = sorted(set(freq_real.index) | set(freq_syn.index))
     p = freq_real.reindex(all_idx, fill_value=0.0).values
     q = freq_syn.reindex(all_idx, fill_value=0.0).values
 
-    js_div = jensenshannon(p, q)  # JS距離
-    return all_idx, p, q, js_div
+    js_dist = jensenshannon(p, q)
+    eval_label = score_js(js_dist)
 
-for col in ['業種分類', '市場・商品区分']:
-    if col in master_real.columns:
-        idx, p, q, js = compare_categorical_distribution(master_real, master_syn, col)
-        print(col, "JS distance:", js)
+    dist_df = pd.DataFrame({
+        "category": all_idx,
+        "real_ratio": p,
+        "syn_ratio": q,
+        "abs_diff": np.abs(p - q)
+    }).sort_values("abs_diff", ascending=False)
 
-# 4.3 相関構造（多変量）の比較
-# 会計データは相関構造が重要（負債が増えれば総資産も増える等）
-# 実データと合成データの 相関行列の差分（ノルム） を見る
-def correlation_diff(df_real, df_syn, name):
+    print(f"Jensen-Shannon距離: {js_dist:.4f} → {eval_label}")
+    print("▼ 構成比の差が大きいカテゴリ上位")
+    print(dist_df.head(10).to_string(index=False))
+
+    print("\n▼ カテゴリ分布の棒グラフを出力（目視確認用）")
+    plot_category_bar(freq_real, freq_syn, col)
+
+    return dist_df, js_dist
+
+
+# =====================================================
+# 3. 相関構造の比較（多変量の関係性 + ヒートマップ）
+# =====================================================
+
+def plot_corr_heatmap(corr: pd.DataFrame, title: str, fname: str) -> None:
+    """
+    相関行列をヒートマップとして保存する。
+    """
+    ensure_fig_dir()
+    plt.figure(figsize=(6, 5))
+    im = plt.imshow(corr, vmin=-1, vmax=1)
+    plt.colorbar(im)
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=90)
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.title(title)
+    plt.tight_layout()
+    path = os.path.join(FIG_DIR, fname)
+    plt.savefig(path)
+    plt.close()
+    print(f"    - 相関ヒートマップを保存: {path}")
+
+
+def correlation_diff(df_real: pd.DataFrame,
+                     df_syn: pd.DataFrame,
+                     name: str) -> Optional[pd.DataFrame]:
+    """
+    数値カラム間の相関行列を比較する。
+
+    評価観点:
+        ・「カラム同士の関係性」（相関構造）がどの程度再現されているか
+        ・平均絶対差分が小さいほど構造が似ている
+        ・実・合成・差分のヒートマップを見比べることで、どの関係性が崩れているかを把握
+    """
+    print(f"\n===== [{name}] 相関構造の再現性チェック =====")
+    print("評価観点: 財務指標など、カラム同士の関係性（相関）がどれくらい再現されているかを確認する。")
+    print("         相関行列の差分の平均が小さいほど、関係性が保たれていると解釈できる。\n")
+
     numeric_cols = df_real.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) == 0:
+        print("※ 数値カラムが存在しません。スキップします。")
+        return None
+
     corr_real = df_real[numeric_cols].corr()
     corr_syn  = df_syn[numeric_cols].corr()
-    # 差の Frobenius ノルム
+
     diff = (corr_real - corr_syn).abs()
-    mean_abs_diff = diff.values[np.triu_indices_from(diff, k=1)].mean()
-    print(f"{name} mean abs corr diff:", mean_abs_diff)
+    # 上三角部分の平均（対角除く）
+    mask = np.triu(np.ones_like(diff, dtype=bool), k=1)
+    mean_abs_diff = diff.where(mask).stack().mean()
+    label = score_corr_mean_abs_diff(mean_abs_diff)
+
+    print(f"平均絶対相関差分: {mean_abs_diff:.4f} → {label}")
+
+    print("\n▼ 相関ヒートマップを出力（real / synthetic / abs diff）")
+    plot_corr_heatmap(corr_real, f"{name} corr (real)", f"corr_{name}_real.png")
+    plot_corr_heatmap(corr_syn,  f"{name} corr (synthetic)", f"corr_{name}_syn.png")
+    plot_corr_heatmap(diff,      f"{name} corr abs diff", f"corr_{name}_diff.png")
+
     return diff
 
-corr_diff_yearly = correlation_diff(yearly_real, yearly_syn, "yearly")
 
-# 5. 視覚的な分布比較（ヒストグラム・箱ひげ・散布図）
-# ここでは 「全カラムループ」＋「代表例を可視化」 の組み合わせがおすすめです。
-import matplotlib.pyplot as plt
-import seaborn as sns
+# =====================================================
+# 4. 時系列の成長率・パターン評価（3年分 + 可視化）
+# =====================================================
 
-def plot_hist_overlay(df_real, df_syn, col, bins=30):
-    plt.figure(figsize=(6,4))
-    sns.histplot(df_real[col], stat="density", bins=bins, label="real", alpha=0.5)
-    sns.histplot(df_syn[col],  stat="density", bins=bins, label="synthetic", alpha=0.5)
-    plt.title(f"Histogram: {col}")
-    plt.legend()
-    plt.tight_layout()
-
-def plot_box_side_by_side(df_real, df_syn, col):
-    plt.figure(figsize=(4,4))
-    tmp = pd.DataFrame({
-        col: pd.concat([df_real[col], df_syn[col]], ignore_index=True),
-        "type": ["real"] * len(df_real) + ["synthetic"] * len(df_syn)
-    })
-    sns.boxplot(x="type", y=col, data=tmp)
-    plt.title(f"Boxplot: {col}")
-    plt.tight_layout()
-
-# 例：売上高、営業利益、総資産、従業員数などの代表カラムを可視化
-# 散布図：売上高 vs 営業利益, 総資産 vs 負債, 従業員数 vs 売上高 などを real/syn で色分け
-def plot_scatter(df_real, df_syn, x, y):
-    plt.figure(figsize=(6,5))
-    plt.scatter(df_real[x], df_real[y], alpha=0.3, label="real")
-    plt.scatter(df_syn[x], df_syn[y], alpha=0.3, label="synthetic")
-    plt.xlabel(x); plt.ylabel(y)
-    plt.legend()
-    plt.title(f"Scatter: {x} vs {y}")
-    plt.tight_layout()
-
-# 6. 時系列傾向の評価（3年分）
-# 6.1 単社ごとのレベル&成長率分布
-# 各 コード について
-# 売上高の年次成長率（(t / t-1 - 1)）、営業利益率などを算出
-# 実 vs 合成で
-# 成長率の分布
-# 利益率の分布
-# 売上高の推移パターン（増加・減少・横ばいの比率）
-def add_growth(df, col_value):
-    df = df.sort_values(['コード', 'YEAR'])
-    df[col_value + "_growth"] = df.groupby('コード')[col_value].pct_change()
+def add_growth(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    指定カラムについて、コード単位で年次成長率を計算して新カラムを追加する。
+    """
+    df = df.sort_values([CODE_COL, YEAR_COL])
+    df[value_col + "_growth"] = df.groupby(CODE_COL)[value_col].pct_change()
     return df
 
-yearly_real = add_growth(yearly_real, '売上高')
-yearly_syn  = add_growth(yearly_syn, '売上高')
 
-# 成長率分布比較（KSなど）
-ks_growth = ks_2samp(
-    yearly_real['売上高_growth'].dropna(),
-    yearly_syn['売上高_growth'].dropna()
-)
-print("売上高_growth KS:", ks_growth)
+def plot_time_series_examples(yearly_real: pd.DataFrame,
+                              yearly_syn: pd.DataFrame,
+                              value_col: str,
+                              n_examples: int = 5) -> None:
+    """
+    代表的なコードをいくつかピックアップし、YEAR×値の推移を折れ線グラフで比較する。
+    「増加/減少/凸凹」などのパターンを目視で確認する。
+    """
+    ensure_fig_dir()
+    codes = yearly_real[CODE_COL].dropna().unique()
+    if len(codes) == 0:
+        return
 
-# ヒストグラムで比較
-plot_hist_overlay(yearly_real.dropna(), yearly_syn.dropna(), '売上高_growth', bins=30)
+    examples = np.random.choice(codes, size=min(n_examples, len(codes)), replace=False)
+    print(f"    - 時系列サンプルとして可視化するコード: {examples}")
 
-# 6.2 パターン分類（増加・減少・凸凹）
-# 3年分（YEARが3つ）なら、例えば：
-# 売上高 グラフ形状を
-# monotonically increasing / decreasing / その他
-# と分類し、パターンの構成比を比較
-def classify_pattern(series):
-    # series: YEAR昇順の売上高
-    s = series.values
-    if len(s) < 3:
-        return "short"
-    inc = (s[2] > s[1] > s[0])
-    dec = (s[2] < s[1] < s[0])
-    if inc:
-        return "increasing"
-    elif dec:
-        return "decreasing"
+    for code in examples:
+        r = yearly_real[yearly_real[CODE_COL] == code].sort_values(YEAR_COL)
+        s = yearly_syn[yearly_syn[CODE_COL] == code].sort_values(YEAR_COL)
+        if len(r) == 0 or len(s) == 0:
+            continue
+
+        plt.figure(figsize=(6, 4))
+        plt.plot(r[YEAR_COL], r[value_col], marker="o", label="real")
+        plt.plot(s[YEAR_COL], s[value_col], marker="o", label="synthetic")
+        plt.title(f"{value_col} time series (コード={code})")
+        plt.xlabel(YEAR_COL)
+        plt.ylabel(value_col)
+        plt.legend()
+        plt.tight_layout()
+        path = os.path.join(FIG_DIR, f"timeseries_{value_col}_code_{code}.png")
+        plt.savefig(path)
+        plt.close()
+        print(f"      - 時系列図を保存: {path}")
+
+
+def evaluate_time_series(yearly_real: pd.DataFrame,
+                         yearly_syn: pd.DataFrame,
+                         value_col: str = VALUE_COL_MAIN) -> None:
+    """
+    時系列（YEAR）の推移パターンを評価する。
+
+    評価観点:
+        ・年次成長率の分布が似ているか（KS検定）
+        ・3年分の形状パターン（増加・減少・その他）の構成比が似ているか
+        ・代表的なコードの折れ線グラフを見比べて、レベルや変動の自然さを視覚的に確認
+    """
+    print(f"\n===== [yearly] 時系列傾向の再現性チェック ({value_col}) =====")
+    print("評価観点: 企業ごとの年次推移が、成長率分布やパターン（増加・減少など）の観点から再現されているかを確認する。")
+    print("         ・成長率分布が似ているか（KS統計量）")
+    print("         ・パターン分類（増加/減少/その他）の構成比が似ているか")
+    print("         ・サンプル企業の折れ線グラフでレベルと形状を目視確認する\n")
+
+    if value_col not in yearly_real.columns or value_col not in yearly_syn.columns:
+        print(f"※ {value_col} が存在しないためスキップします。")
+        return
+    if YEAR_COL not in yearly_real.columns or YEAR_COL not in yearly_syn.columns:
+        print(f"※ {YEAR_COL} が存在しないためスキップします。")
+        return
+
+    yearly_real_g = add_growth(yearly_real.copy(), value_col)
+    yearly_syn_g  = add_growth(yearly_syn.copy(),  value_col)
+
+    # 成長率分布比較
+    r = yearly_real_g[value_col + "_growth"].replace([np.inf, -np.inf], np.nan).dropna()
+    s = yearly_syn_g[value_col + "_growth"].replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(r) > 0 and len(s) > 0:
+        ks_stat, pval = ks_2samp(r, s)
+        label = score_ks(ks_stat)
+        print(f"成長率分布のKS統計量: {ks_stat:.4f}, p値: {pval:.4g} → {label}")
     else:
-        return "other"
+        print("※ 成長率の有効データが不足しています。")
 
-def pattern_distribution(df):
-    patterns = df.sort_values(['コード', 'YEAR']).groupby('コード')['売上高'].apply(classify_pattern)
-    return patterns.value_counts(normalize=True)
+    # 成長率ヒストグラム（目視用）
+    print("\n▼ 成長率分布のヒストグラムを出力（目視確認用）")
+    plot_hist_overlay(yearly_real_g, yearly_syn_g, value_col + "_growth", bins=40)
 
-print("real pattern dist:\n", pattern_distribution(yearly_real))
-print("syn  pattern dist:\n", pattern_distribution(yearly_syn))
+    # パターン分類
+    def classify_pattern(series: pd.Series) -> str:
+        s_val = series.values
+        if len(s_val) < 3:
+            return "short"
+        inc = (s_val[2] > s_val[1] > s_val[0])
+        dec = (s_val[2] < s_val[1] < s_val[0])
+        if inc:
+            return "increasing"
+        elif dec:
+            return "decreasing"
+        else:
+            return "other"
 
-# 6.3 時系列の視覚的確認
-# 代表的な数社をサンプリングし、売上高 / 営業利益 の YEAR 推移を折れ線で real vs syn を比較。
-def plot_time_series_example(df_real, df_syn, code, col):
-    fig, ax = plt.subplots(figsize=(6,4))
-    r = df_real[df_real['コード'] == code].sort_values('YEAR')
-    s = df_syn[df_syn['コード'] == code].sort_values('YEAR')
-    ax.plot(r['YEAR'], r[col], marker='o', label='real')
-    ax.plot(s['YEAR'], s[col], marker='o', label='synthetic')
-    ax.set_title(f"{col} time series (コード={code})")
-    ax.legend()
+    pat_real = yearly_real.sort_values([CODE_COL, YEAR_COL]) \
+                          .groupby(CODE_COL)[value_col].apply(classify_pattern)
+    pat_syn  = yearly_syn.sort_values([CODE_COL, YEAR_COL]) \
+                         .groupby(CODE_COL)[value_col].apply(classify_pattern)
+
+    dist_real = pat_real.value_counts(normalize=True)
+    dist_syn  = pat_syn.value_counts(normalize=True)
+
+    print("\n▼ パターン構成比（実データ）")
+    print(dist_real.to_string())
+    print("\n▼ パターン構成比（合成データ）")
+    print(dist_syn.to_string())
+
+    # 時系列のサンプルプロット
+    print("\n▼ サンプル企業の時系列推移を出力（目視確認用）")
+    plot_time_series_examples(yearly_real, yearly_syn, value_col, n_examples=5)
+
+
+# =====================================================
+# 5. 業種別の統計・傾向評価（親子結合 + 可視化）
+# =====================================================
+
+def evaluate_industry_profile(master_real: pd.DataFrame,
+                              master_syn: pd.DataFrame,
+                              yearly_real: pd.DataFrame,
+                              yearly_syn: pd.DataFrame,
+                              industry_col: str = INDUSTRY_COL,
+                              value_col: str = VALUE_COL_MAIN) -> Optional[pd.DataFrame]:
+    """
+    業種別の財務プロファイルを比較する。
+
+    評価観点:
+        ・業種ごとの平均・分散・中央値などの統計量が似ているか
+        ・業種ごとの売上レベルやばらつきが大きく異ならないか
+        ・箱ひげ図を用いて業種 × 値の分布を視覚的に比較
+    """
+    print(f"\n===== [industry] 業種別プロファイルの再現性チェック ({value_col}) =====")
+    print("評価観点: 業種ごとに売上高などの水準・ばらつきが実データと合成データで似ているかを確認する。")
+    print("         業種別の分布が大きくずれている場合、業種構造の保持に課題があると判断できる。\n")
+
+    if industry_col not in master_real.columns or industry_col not in master_syn.columns:
+        print(f"※ 親テーブルに {industry_col} がないためスキップします。")
+        return None
+
+    # 親子結合
+    yearly_real_join = yearly_real.merge(
+        master_real[[CODE_COL, industry_col]], on=CODE_COL, how="left"
+    )
+    yearly_syn_join  = yearly_syn.merge(
+        master_syn[[CODE_COL, industry_col]], on=CODE_COL, how="left"
+    )
+
+    if value_col not in yearly_real_join.columns or value_col not in yearly_syn_join.columns:
+        print(f"※ {value_col} が存在しないためスキップします。")
+        return None
+
+    def industry_stats(df: pd.DataFrame) -> pd.DataFrame:
+        return df.groupby(industry_col)[value_col].agg(["mean", "std", "median", "count"])
+
+    real_stats = industry_stats(yearly_real_join)
+    syn_stats  = industry_stats(yearly_syn_join)
+
+    diff_ind = real_stats.join(syn_stats, lsuffix="_real", rsuffix="_syn")
+
+    print("▼ 業種別の統計量比較（例として先頭5業種）")
+    print(diff_ind.head().to_string())
+
+    # 箱ひげ図（業種別分布を比較）
+    ensure_fig_dir()
+    yearly_real_join["type"] = "real"
+    yearly_syn_join["type"]  = "synthetic"
+    plot_df = pd.concat([yearly_real_join[[industry_col, value_col, "type"]],
+                         yearly_syn_join[[industry_col, value_col, "type"]]],
+                        ignore_index=True)
+
+    plt.figure(figsize=(max(8, len(plot_df[industry_col].unique()) * 0.6), 4))
+    # boxplotだけを使う（ライブラリに依存しないやり方：グループごとに描画しても良いが簡易にpandasのboxplotでもOK）
+    # ここではMatplotlibでシンプルに描くために少しトリックを使う
+    # （GitHub共有前提なので必要以上に凝らない）
+    cats = sorted(plot_df[industry_col].unique())
+    x_positions = np.arange(len(cats))
+    width = 0.35
+
+    for i, t in enumerate(["real", "synthetic"]):
+        data = []
+        positions = []
+        for j, cat in enumerate(cats):
+            vals = plot_df[(plot_df[industry_col] == cat) & (plot_df["type"] == t)][value_col].dropna()
+            if len(vals) == 0:
+                continue
+            data.append(vals)
+            if t == "real":
+                positions.append(j - width/2)
+            else:
+                positions.append(j + width/2)
+        if data:
+            bp = plt.boxplot(
+                data,
+                positions=positions,
+                widths=width*0.9,
+                patch_artist=True,
+                manage_ticks=False,
+                labels=[""] * len(data),
+            )
+            for patch in bp["boxes"]:
+                patch.set_alpha(0.5)
+            # 色指定なし（デフォルト色を利用）
+
+    plt.xticks(x_positions, cats, rotation=90)
+    plt.ylabel(value_col)
+    plt.title(f"{value_col} by {industry_col} (real vs synthetic)")
+    # 簡易凡例
+    plt.plot([], [], label="real")       # ダミー
+    plt.plot([], [], label="synthetic")  # ダミー
+    plt.legend()
     plt.tight_layout()
+    path = os.path.join(FIG_DIR, f"box_{value_col}_by_{industry_col}.png")
+    plt.savefig(path)
+    plt.close()
+    print(f"▼ 業種別箱ひげ図を保存: {path}")
 
-7. 業種別の傾向保持
-7.1 業種別の基本統計
-親テーブル 業種分類 × 子テーブルの財務指標
-例：業種分類 × 売上高 の平均, 分散, 利益率 etc.
-実 vs 合成で「業種プロファイル」が似ているかを見る
+    return diff_ind
 
-# 親子結合
-yearly_real_join = yearly_real.merge(master_real[['コード', '業種分類']], on='コード', how='left')
-yearly_syn_join  = yearly_syn.merge(master_syn[['コード', '業種分類']],   on='コード', how='left')
 
-def industry_stats(df, value_col):
-    return df.groupby('業種分類')[value_col].agg(['mean', 'std', 'median', 'count'])
+# =====================================================
+# 6. 妥当性チェック（レンジ・会計恒等式・外れ値）
+# =====================================================
 
-real_ind_stats = industry_stats(yearly_real_join, '売上高')
-syn_ind_stats  = industry_stats(yearly_syn_join,  '売上高')
+def check_value_ranges(df: pd.DataFrame,
+                       rules: Dict[str, Tuple[Optional[float], Optional[float]]],
+                       name: str) -> Dict[str, int]:
+    """
+    カラムごとにレンジルールを適用し、違反件数を集計する。
 
-# 差分
-diff_ind = real_ind_stats.join(syn_ind_stats, lsuffix="_real", rsuffix="_syn")
-print(diff_ind.head())
+    評価観点:
+        ・明らかにおかしな値（負の売上、高すぎる比率など）がどの程度存在するか
+        ・カラムごとの違反率に対して、閾値を用いた評価ラベルを付与
+    """
+    print(f"\n===== [{name}] 値の範囲チェック =====")
+    print("評価観点: 各カラムにありえない値（例: 負の売上、異常な比率）が含まれていないかを確認する。")
+    print("         違反件数・違反率に基づき、どのカラムに問題が集中しているかを把握する。\n")
 
-7.2 業種別分布の比較（視覚）
-Violin plot / boxplot で 業種分類 × 売上高 を real/syn 並べる
-散布図で 業種分類 を色分け
-
-def plot_industry_box(df_real, df_syn, col):
-    df_real_ = df_real.copy()
-    df_real_['type'] = 'real'
-    df_syn_  = df_syn.copy()
-    df_syn_['type'] = 'synthetic'
-    tmp = pd.concat([df_real_, df_syn_], ignore_index=True)
-
-    plt.figure(figsize=(10,4))
-    sns.boxplot(x='業種分類', y=col, hue='type', data=tmp)
-    plt.xticks(rotation=90)
-    plt.title(f"{col} by industry (real vs synthetic)")
-    plt.tight_layout()
-
-8. 妥当性チェック（値の範囲・制約）
-8.1 単項目のレンジチェック
-
-例（財務データ系）
-
-売上高, 利益, 総資産, 負債, 純資産 ≥ 0 （一部マイナス許容するかは業種次第）
-
-比率（ROE, 利益率など）は常識的な範囲（例：[-3, 3]）に収まるか
-
-# 例: 汎用的なレンジルールを dict で定義
-range_rules = {
-    '売上高': (0, None),
-    '営業利益': (None, None),  # 赤字を許容するなら下限なし
-    '総資産': (0, None),
-    '負債': (0, None),
-    '純資産': (None, None),   # マイナス純資産もありうる
-}
-
-def check_ranges(df, rules):
-    violations = {}
+    violations: Dict[str, int] = {}
+    n = len(df)
     for col, (min_v, max_v) in rules.items():
         if col not in df.columns:
             continue
@@ -289,139 +641,178 @@ def check_ranges(df, rules):
             cond |= series < min_v
         if max_v is not None:
             cond |= series > max_v
-        violations[col] = cond.sum()
+        cnt = cond.sum()
+        violations[col] = cnt
+        ratio = cnt / n if n > 0 else 0.0
+        label = score_ratio_small_is_good(ratio)
+        print(f"  カラム: {col} / 違反件数: {cnt} / 違反率: {ratio:.4%} → {label}")
+
     return violations
 
-print("range violations (synthetic):")
-print(check_ranges(yearly_syn, range_rules))
 
-8.2 カラム間制約（会計恒等式）
+def check_balance_constraint(df: pd.DataFrame,
+                             name: str,
+                             total_col: str = TOTAL_ASSET_COL,
+                             debt_col: str = DEBT_COL,
+                             equity_col: str = EQUITY_COL,
+                             tol_ratio: float = 0.01,
+                             tol_abs: float = 1e6) -> Tuple[Optional[pd.Series], Optional[pd.Series]]:
+    """
+    会計恒等式: 総資産 ≒ 負債 + 純資産 をチェックする。
 
-例：
+    評価観点:
+        ・財務諸表の基本的な整合性が保たれているか
+        ・恒等式からの乖離が大きいレコードが多いかどうか
+        ・違反率に対して評価ラベルを付与
+    """
+    print(f"\n===== [{name}] 会計恒等式チェック =====")
+    print("評価観点: 総資産 ≒ 負債 + 純資産 の整合性が保たれているかを確認する。")
+    print("         一定の誤差（総資産の1% + 定数）を超える違反が多いと、会計的に不自然と判断できる。\n")
 
-総資産 ≈ 負債 + 純資産（誤差は丸めや分類の関係で許容）
+    for c in [total_col, debt_col, equity_col]:
+        if c not in df.columns:
+            print(f"※ {c} が存在しないため会計恒等式チェックをスキップします。")
+            return None, None
 
-営業利益 ≤ 経常利益 ≤ 税引前当期純利益 のような階層構造（科目構造に応じて）
-
-合成データでこの制約が大きく崩れていないか
-
-def check_balance(df):
-    # カラム名は実データに合わせて変更してください
-    if not set(['総資産', '負債', '純資産']).issubset(df.columns):
-        return None
-    diff = df['総資産'] - (df['負債'] + df['純資産'])
-    # 許容誤差（例：総資産の1% + 定数）
-    tol = df['総資産'].abs() * 0.01 + 1e6
+    diff = df[total_col] - (df[debt_col] + df[equity_col])
+    tol = df[total_col].abs() * tol_ratio + tol_abs
     violation = (diff.abs() > tol)
-    print("balance violations:", violation.sum(), "/", len(df))
+
+    total = len(df)
+    cnt = violation.sum()
+    ratio = cnt / total if total > 0 else 0.0
+    label = score_ratio_small_is_good(ratio)
+
+    print(f"  会計恒等式違反件数: {cnt} / {total} （{ratio:.4%}） → {label}")
+
     return diff, violation
 
-diff_syn, viol_syn = check_balance(yearly_syn)
 
-8.3 外れ値・極端なパターン
+def outlier_rate(df: pd.DataFrame, col: str, method: str = "iqr") -> float:
+    """
+    外れ値率を計算する。
 
-Zスコアや IQR で外れ値を検出し、
-実 vs 合成 で「極端値の頻度」が近いか、異常に多く/少なくないかを比較
-
-def outlier_rate(df, col, method="iqr"):
+    評価観点:
+        ・外れ値の頻度が実データと極端に異ならないか
+        ・「外れ値が多すぎる」または「極端に少なすぎる」場合、
+          分布の裾や極端値の扱いに課題がある可能性
+    """
     x = df[col].dropna()
+    if len(x) == 0:
+        return np.nan
     if method == "iqr":
         q1, q3 = x.quantile(0.25), x.quantile(0.75)
         iqr = q3 - q1
         lower, upper = q1 - 1.5*iqr, q3 + 1.5*iqr
         return ((x < lower) | (x > upper)).mean()
     else:
-        z = (x - x.mean()) / x.std()
+        z = (x - x.mean()) / x.std(ddof=0)
         return (z.abs() > 3).mean()
 
-for col in ['売上高', '営業利益', '総資産']:
-    if col in yearly_real.columns:
-        print(col, "outlier rate real:", outlier_rate(yearly_real, col))
-        print(col, "outlier rate syn :", outlier_rate(yearly_syn,  col))
 
-9. 追加で入れておきたい観点（AI視点）
-9.1 欠損パターンの再現性
+def compare_outlier_rates(yearly_real: pd.DataFrame,
+                          yearly_syn: pd.DataFrame,
+                          cols: List[str]) -> None:
+    """
+    外れ値率を実データと合成データで比較する。
 
-「どのカラムにどの程度 NA があるか」
--> 実と合成で似ているか
+    評価観点:
+        ・外れ値率が実データと大きく乖離していないか
+        ・乖離が大きい場合、極端値の扱いや裾の形状に問題がある可能性
+    """
+    print("\n===== [yearly] 外れ値率の比較 =====")
+    print("評価観点: 外れ値の出現頻度が実データと合成データで大きく乖離していないかを確認する。")
+    print("         外れ値が多すぎる/少なすぎる場合、分布の裾や極端値の扱いに課題があると判断できる。\n")
 
-def missing_profile(df):
-    return df.isna().mean()
+    for col in cols:
+        if col not in yearly_real.columns or col not in yearly_syn.columns:
+            print(f"※ {col} が存在しないためスキップします。")
+            continue
+        r_rate = outlier_rate(yearly_real, col)
+        s_rate = outlier_rate(yearly_syn,  col)
+        if np.isnan(r_rate) or np.isnan(s_rate):
+            print(f"  カラム: {col} / 有効データ不足のためスキップ")
+            continue
+        diff = abs(r_rate - s_rate)
+        # ここでは「外れ値率の差」が大きいかどうかを簡易評価
+        if diff < 0.01:
+            label = "◎ 外れ値率はほぼ同じ"
+        elif diff < 0.03:
+            label = "○ 多少の差はあるが許容範囲"
+        elif diff < 0.07:
+            label = "△ 差がやや大きい（要確認）"
+        else:
+            label = "× 差が大きい（極端値の扱いに課題）"
 
-miss_real = missing_profile(yearly_real)
-miss_syn  = missing_profile(yearly_syn)
-missing_compare = pd.DataFrame({"real": miss_real, "syn": miss_syn})
+        print(f"  カラム: {col}")
+        print(f"    実データ 外れ値率: {r_rate:.4%}")
+        print(f"    合成データ外れ値率: {s_rate:.4%}")
+        print(f"    差: {diff:.4%} → {label}")
 
-9.2 クラスタ構造の再現性
 
-数値カラムを標準化して PCA / t-SNE し、クラスター構造を real / syn で重ねて可視化
+# =====================================================
+# 7. 全評価をまとめて実行するメイン関数
+# =====================================================
 
-あるいは、KMeansクラスタリングして cluster ラベルの比率を比較
+def run_all_evaluations(master_real: pd.DataFrame,
+                        master_syn: pd.DataFrame,
+                        yearly_real: pd.DataFrame,
+                        yearly_syn: pd.DataFrame) -> None:
+    """
+    一連の評価をまとめて実行するメイン関数。
+    """
+    print("######################################")
+    print("# 合成データ品質評価（実行開始）")
+    print("######################################\n")
 
-→ これにより「財務的特徴空間における配置」がどれくらい似ているかを評価できます。
+    # --- 1. 統計的再現性（数値分布） ---
+    compare_numeric_distributions(master_real, master_syn, "master")
+    compare_numeric_distributions(yearly_real, yearly_syn, "yearly")
 
-9.3 プライバシー・過学習の簡易チェック
+    # --- 2. カテゴリ分布（例: 業種分類 / 市場・商品区分） ---
+    for col in [INDUSTRY_COL, MARKET_COL]:
+        if col in master_real.columns and col in master_syn.columns:
+            compare_categorical_distribution(master_real, master_syn, col, "master")
+        else:
+            print(f"\n※ カテゴリカラム {col} が親テーブルに見つからないためスキップします。")
 
-合成データのレコードが実データのレコードと「ほぼ一致」していないか（距離がゼロ or 非常に小さい）を確認
+    # --- 3. 相関構造 ---
+    correlation_diff(yearly_real, yearly_syn, "yearly")
 
-最近傍距離（real ↔ syn）分布を比較し、「ほぼコピー」がないかを見る
+    # --- 4. 時系列傾向 ---
+    if YEAR_COL in yearly_real.columns and YEAR_COL in yearly_syn.columns:
+        evaluate_time_series(yearly_real, yearly_syn, value_col=VALUE_COL_MAIN)
+    else:
+        print(f"\n※ {YEAR_COL} カラムが存在しないため時系列評価をスキップします。")
 
-10. 修正方針（問題が見つかった場合）
-10.1 単純な対処（ポストプロセス）
+    # --- 5. 業種別プロファイル ---
+    evaluate_industry_profile(master_real, master_syn, yearly_real, yearly_syn,
+                              industry_col=INDUSTRY_COL, value_col=VALUE_COL_MAIN)
 
-レンジのクリッピング
+    # --- 6. 妥当性チェック ---
+    check_value_ranges(yearly_syn, RANGE_RULES_YEARLY, "yearly_synthetic")
 
-例：売上高 < 0 の場合は 0 に丸める、比率は [-3, 3] にクリップなど
+    check_balance_constraint(yearly_syn, "yearly_synthetic",
+                             total_col=TOTAL_ASSET_COL,
+                             debt_col=DEBT_COL,
+                             equity_col=EQUITY_COL)
 
-会計恒等式の調整
+    compare_outlier_rates(yearly_real, yearly_syn, cols=OUTLIER_COLS)
 
-例：総資産 を固定して 負債 と 純資産 を割合でスケーリングし合計を合わせる
+    print("\n######################################")
+    print("# 合成データ品質評価（実行完了）")
+    print("# ・ログの数値と◎/○/△/×のコメントで定量的な良し悪しを把握")
+    print("# ・figs/ 以下の画像で分布・相関・時系列・業種別の視覚的な違いを確認")
+    print("######################################")
 
-業種ごとの再スケーリング
 
-業種分類 ごとに、実データの平均・分散に近づくよう
-合成値を線形変換（平均・標準偏差マッチング）
+# =====================================================
+# 8. スクリプトとして実行されたときのエントリポイント
+# =====================================================
 
-def match_mean_std(s_syn, target_mean, target_std, eps=1e-8):
-    s = s_syn.copy()
-    cur_mean, cur_std = s.mean(), s.std() + eps
-    s = (s - cur_mean) / cur_std * target_std + target_mean
-    return s
+if __name__ == "__main__":
+    # 1. データ読み込み
+    master_real_df, master_syn_df, yearly_real_df, yearly_syn_df = load_data()
 
-10.2 生成モデル側の改良
-
-条件付き生成：業種・市場区分・YEAR を入力として生成することで、
-
-業種別の分布差や時系列パターンを自然に制御
-
-制約付き生成 / 損失関数へのペナルティ
-
-総資産 - 負債 - 純資産 の誤差をペナルティに
-負の売上・極端な比率などに対してもペナルティ
-分布距離を損失に組み込む
-代表的なカラムについて、実 vs 合成の分布距離（例えば MMD, Wasserstein）を最小化するよう学習
-
-10.3 評価に基づくフィードバックループ
-上記の評価指標（KS distance, 相関差, 制約違反数 etc.）を「スコア」としてまとめる
-バージョンごとにスコアを記録 → 改善が見える形にする
-最終的には「合格ライン」（例えば：
-主な数値カラムの KS statistic < 0.1
-会計恒等式の違反率 < 1%
-負の売上ゼロ etc.）
-を設定し、その閾値を満たすことを目標にする
-
-11. まとめ
-すべての数値・カテゴリ特徴量に対して：
-単変量分布・カテゴリ分布・相関構造を比較
-時系列：
-レベルだけでなく、成長率・パターン（増加/減少など）の構成比を比較
-業種：
-業種分類 を軸に統計量・分布・相関を比較し、業種プロファイルの再現を確認
-妥当性：
-値のレンジ、会計恒等式、比率、外れ値などをチェック
-追加観点：
-欠損パターン、クラスタ構造、プライバシー（過学習）まで含めるとより安心
-もしよければ次のステップとして：
-実際に使う「評価レポートのフォーマット（表・図の構成）」
-または「指標を1つのスコアにまとめる設計」
-も一緒に設計できます。どちらを先に具体化したいか教えてもらえれば、それ前提でコードとレポート雛形も出します。
+    # 2. 評価実行
+    run_all_evaluations(master_real_df, master_syn_df, yearly_real_df, yearly_syn_df)
